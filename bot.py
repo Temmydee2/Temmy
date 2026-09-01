@@ -4,11 +4,12 @@ import time
 import requests
 
 # =========================================================
-# TEMMYDEEXC — RENDER TELEGRAM TOKEN SCANNER
-# READ-ONLY — NO BUYING / SELLING
+# TEMMYDEEXC SCANNER BOT
+# SELF-CONTAINED — READ ONLY
+# NO BUYING / SELLING
 # =========================================================
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN environment variable is missing.")
@@ -20,48 +21,134 @@ CHAINS = {
 }
 
 
-def get_pairs(chain, token):
-    if chain not in CHAINS:
-        raise ValueError(f"Unsupported chain: {chain}")
+# =========================================================
+# TELEGRAM
+# =========================================================
 
-    url = (
-        f"https://api.dexscreener.com/token-pairs/v1/"
-        f"{CHAINS[chain]}/{token}"
+def telegram_request(method, payload=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+
+    response = requests.post(
+        url,
+        json=payload or {},
+        timeout=40
     )
 
-    response = requests.get(url, timeout=20)
     response.raise_for_status()
-
     data = response.json()
 
-    if not isinstance(data, list):
-        raise ValueError("Unexpected DexScreener response.")
+    if not data.get("ok"):
+        raise RuntimeError(data)
 
     return data
 
 
+def send_message(chat_id, text):
+    telegram_request(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+    )
+
+
+# =========================================================
+# ADDRESS DETECTION
+# =========================================================
+
+def looks_like_solana(address):
+    return bool(
+        re.fullmatch(
+            r"[1-9A-HJ-NP-Za-km-z]{32,44}",
+            address
+        )
+    )
+
+
+def looks_like_evm(address):
+    return bool(
+        re.fullmatch(
+            r"0x[a-fA-F0-9]{40}",
+            address
+        )
+    )
+
+
+# =========================================================
+# DEXSCREENER
+# =========================================================
+
+def get_pairs(chain, token):
+
+    if chain not in CHAINS:
+        raise ValueError("Unsupported chain.")
+
+    chain_id = CHAINS[chain]
+
+    url = (
+        "https://api.dexscreener.com/"
+        f"token-pairs/v1/{chain_id}/{token}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=30
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"DexScreener HTTP {response.status_code}"
+        )
+
+    data = response.json()
+
+    if not isinstance(data, list):
+        raise RuntimeError(
+            "Unexpected DexScreener response."
+        )
+
+    return data
+
+
+# =========================================================
+# TOKEN ANALYZER
+# =========================================================
+
 def analyze_token(chain, token):
+
     pairs = get_pairs(chain, token)
 
-    valid_pairs = [
-        p for p in pairs
-        if p.get("liquidity", {}).get("usd") is not None
-    ]
+    valid_pairs = []
+
+    for pair in pairs:
+
+        liquidity = (
+            pair.get("liquidity", {})
+            .get("usd")
+        )
+
+        if liquidity is not None:
+            valid_pairs.append(pair)
 
     if not valid_pairs:
-        raise ValueError("No usable token/pool data found.")
+        raise RuntimeError(
+            "No usable token or liquidity data found."
+        )
 
     valid_pairs.sort(
-        key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0,
+        key=lambda p:
+        p.get("liquidity", {}).get("usd", 0) or 0,
         reverse=True
     )
 
-    liquidity = sum(
+    total_liquidity = sum(
         p.get("liquidity", {}).get("usd", 0) or 0
         for p in valid_pairs
     )
 
-    volume = sum(
+    total_volume = sum(
         p.get("volume", {}).get("h24", 0) or 0
         for p in valid_pairs
     )
@@ -69,8 +156,16 @@ def analyze_token(chain, token):
     buys = 0
     sells = 0
 
-    for p in valid_pairs:
-        txns = p.get("txns", {}).get("h24", {})
+    for pair in valid_pairs:
+
+        txns = pair.get(
+            "txns",
+            {}
+        ).get(
+            "h24",
+            {}
+        )
+
         buys += txns.get("buys", 0) or 0
         sells += txns.get("sells", 0) or 0
 
@@ -83,18 +178,32 @@ def analyze_token(chain, token):
     )
 
     volume_liquidity = (
-        volume / liquidity
-        if liquidity
+        total_volume / total_liquidity
+        if total_liquidity
         else 0
     )
 
     strongest = valid_pairs[0]
 
-    base = strongest.get("baseToken", {})
+    base_token = strongest.get(
+        "baseToken",
+        {}
+    )
 
-    name = base.get("name", "Unknown")
-    symbol = base.get("symbol", "Unknown")
-    price = strongest.get("priceUsd", "Unknown")
+    name = base_token.get(
+        "name",
+        "Unknown"
+    )
+
+    symbol = base_token.get(
+        "symbol",
+        "Unknown"
+    )
+
+    price = strongest.get(
+        "priceUsd",
+        "Unknown"
+    )
 
     # =====================================================
     # BASIC RISK SCORE
@@ -103,48 +212,92 @@ def analyze_token(chain, token):
     score = 100
     flags = []
 
-    if liquidity < 5000:
+    if total_liquidity < 5000:
+
         score -= 35
-        flags.append("🔴 Very low liquidity")
 
-    elif liquidity < 10000:
+        flags.append(
+            "🔴 Very low liquidity"
+        )
+
+    elif total_liquidity < 10000:
+
         score -= 20
-        flags.append("🟠 Low liquidity")
 
-    elif liquidity < 50000:
+        flags.append(
+            "🟠 Low liquidity"
+        )
+
+    elif total_liquidity < 50000:
+
         score -= 10
-        flags.append("🟡 Moderate liquidity")
+
+        flags.append(
+            "🟡 Moderate liquidity"
+        )
 
     if volume_liquidity > 30:
+
         score -= 20
-        flags.append("🟠 Extremely high volume/liquidity")
+
+        flags.append(
+            "🟠 Extremely high volume/liquidity"
+        )
 
     elif volume_liquidity > 10:
+
         score -= 10
-        flags.append("🟡 High volume/liquidity")
+
+        flags.append(
+            "🟡 High volume/liquidity"
+        )
 
     if trades:
+
         if buy_pressure < 45:
+
             score -= 20
-            flags.append("🔴 Strong sell pressure")
+
+            flags.append(
+                "🔴 Strong sell pressure"
+            )
 
         elif buy_pressure < 50:
-            score -= 10
-            flags.append("🟠 Sell pressure")
 
-    score = max(0, min(100, score))
+            score -= 10
+
+            flags.append(
+                "🟠 Sell pressure"
+            )
+
+    score = max(
+        0,
+        min(100, score)
+    )
 
     if score >= 80:
-        rating = "🟢 LOWER RISK — INVESTIGATE"
+
+        rating = (
+            "🟢 LOWER RISK — INVESTIGATE"
+        )
 
     elif score >= 60:
-        rating = "🟡 MODERATE RISK"
+
+        rating = (
+            "🟡 MODERATE RISK"
+        )
 
     elif score >= 40:
-        rating = "🟠 HIGH RISK"
+
+        rating = (
+            "🟠 HIGH RISK"
+        )
 
     else:
-        rating = "🔴 EXTREME RISK"
+
+        rating = (
+            "🔴 EXTREME RISK"
+        )
 
     return {
         "chain": chain,
@@ -152,8 +305,8 @@ def analyze_token(chain, token):
         "name": name,
         "symbol": symbol,
         "price": price,
-        "liquidity": liquidity,
-        "volume": volume,
+        "liquidity": total_liquidity,
+        "volume": total_volume,
         "buys": buys,
         "sells": sells,
         "buy_pressure": buy_pressure,
@@ -162,19 +315,34 @@ def analyze_token(chain, token):
         "score": score,
         "rating": rating,
         "flags": flags,
-        "dex": strongest.get("dexId", "Unknown"),
-        "url": strongest.get("url", ""),
+        "dex": strongest.get(
+            "dexId",
+            "Unknown"
+        ),
+        "url": strongest.get(
+            "url",
+            ""
+        ),
     }
 
 
-def make_alert(data):
-    flags = data["flags"]
+# =========================================================
+# TELEGRAM ALERT
+# =========================================================
 
-    risk_flags = (
-        "\n".join(flags)
-        if flags
-        else "✅ No basic risk flags detected"
-    )
+def make_alert(data):
+
+    if data["flags"]:
+
+        risk_flags = "\n".join(
+            data["flags"]
+        )
+
+    else:
+
+        risk_flags = (
+            "✅ No basic risk flags detected"
+        )
 
     return f"""🤖 TEMMYDEEXC SCANNER
 
@@ -217,8 +385,7 @@ ${data["volume"]:,.2f}
 ⚠️ READ-ONLY ANALYSIS
 No automatic buying or selling.
 
-Holder concentration, deployer history,
-and deeper contract checks are not included yet.
+⚠️ This score is NOT a guarantee that a token is safe.
 
 🔎 Research before trading.
 
@@ -226,59 +393,65 @@ and deeper contract checks are not included yet.
 """
 
 
-def looks_like_solana(address):
-    return bool(
-        re.fullmatch(
-            r"[1-9A-HJ-NP-Za-km-z]{32,44}",
-            address
-        )
-    )
-
-
-def looks_like_evm(address):
-    return bool(
-        re.fullmatch(
-            r"0x[a-fA-F0-9]{40}",
-            address
-        )
-    )
-
+# =========================================================
+# AUTOMATIC CHAIN DETECTION
+# =========================================================
 
 def scan_automatic(token):
-    # =====================================================
+
+    token = token.strip()
+
+    # -----------------------------
     # SOLANA
-    # =====================================================
+    # -----------------------------
 
     if looks_like_solana(token):
-        print(f"🔎 Checking SOLANA: {token}")
+
+        print(
+            f"🔎 Checking SOLANA: {token}",
+            flush=True
+        )
 
         try:
-            result = analyze_token("solana", token)
+
+            result = analyze_token(
+                "solana",
+                token
+            )
+
             return make_alert(result)
 
         except Exception as e:
+
             return (
                 "❌ SOLANA SCAN FAILED\n\n"
                 f"{type(e).__name__}: {e}"
             )
 
-    # =====================================================
+    # -----------------------------
     # EVM
-    # BNB + ROBINHOOD
-    # =====================================================
+    # -----------------------------
 
     if looks_like_evm(token):
 
         results = []
 
-        for chain in ["bnb", "robinhood"]:
+        for chain in [
+            "bnb",
+            "robinhood"
+        ]:
 
             print(
-                f"🔎 Checking {chain.upper()}: {token}"
+                f"🔎 Checking {chain.upper()}: {token}",
+                flush=True
             )
 
             try:
-                result = analyze_token(chain, token)
+
+                result = analyze_token(
+                    chain,
+                    token
+                )
 
                 results.append(
                     make_alert(result)
@@ -288,11 +461,16 @@ def scan_automatic(token):
 
                 print(
                     f"⚠️ {chain.upper()} not found: "
-                    f"{type(e).__name__}: {e}"
+                    f"{type(e).__name__}: {e}",
+                    flush=True
                 )
 
         if results:
-            return "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(results)
+
+            return (
+                "\n\n━━━━━━━━━━━━━━━━━━\n\n"
+                .join(results)
+            )
 
         return (
             "❌ TOKEN NOT FOUND\n\n"
@@ -306,33 +484,56 @@ def scan_automatic(token):
     )
 
 
-def send_message(chat_id, text):
+# =========================================================
+# TELEGRAM BOT
+# =========================================================
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
+def run_bot():
+
+    print(
+        "🤖 TEMMYDEEXC BOT IS LIVE",
+        flush=True
     )
 
-    response = requests.post(
-        url,
-        json={
-            "chat_id": chat_id,
-            "text": text,
-            "disable_web_page_preview": True,
-        },
-        timeout=20,
+    print(
+        "=========================",
+        flush=True
     )
 
-    response.raise_for_status()
+    print(
+        "📋 Paste a contract address only.",
+        flush=True
+    )
 
+    print(
+        "🔐 READ-ONLY — NO TRADING",
+        flush=True
+    )
 
-def main():
+    # Test token
 
-    print("🤖 TEMMYDEEXC BOT IS LIVE")
-    print("==========================")
-    print("📋 Paste contract addresses only.")
-    print("🔐 READ-ONLY — NO TRADING")
-    print()
+    try:
+
+        me = telegram_request("getMe")
+
+        bot = me["result"]
+
+        print(
+            f"✅ Telegram connected: "
+            f"{bot.get('first_name')} "
+            f"@{bot.get('username')}",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            "❌ Telegram connection failed:",
+            e,
+            flush=True
+        )
+
+        return
 
     offset = None
 
@@ -345,27 +546,47 @@ def main():
                 f"bot{TELEGRAM_TOKEN}/getUpdates",
                 params={
                     "timeout": 30,
-                    "offset": offset,
+                    "offset": offset
                 },
-                timeout=40,
+                timeout=40
             )
 
             data = response.json()
 
             if not data.get("ok"):
-                print("❌ Telegram error:", data)
+
+                print(
+                    "❌ Telegram error:",
+                    data,
+                    flush=True
+                )
+
                 time.sleep(5)
+
                 continue
 
-            for update in data.get("result", []):
+            for update in data.get(
+                "result",
+                []
+            ):
 
-                offset = update["update_id"] + 1
+                offset = (
+                    update["update_id"] + 1
+                )
 
-                message = update.get("message", {})
+                message = update.get(
+                    "message",
+                    {}
+                )
 
-                chat_id = message.get(
-                    "chat", {}
-                ).get("id")
+                chat = message.get(
+                    "chat",
+                    {}
+                )
+
+                chat_id = chat.get(
+                    "id"
+                )
 
                 text = message.get(
                     "text",
@@ -375,9 +596,9 @@ def main():
                 if not chat_id or not text:
                     continue
 
-                # =========================================
-                # START
-                # =========================================
+                # -------------------------
+                # COMMANDS
+                # -------------------------
 
                 if text == "/start":
 
@@ -385,32 +606,33 @@ def main():
                         chat_id,
                         "🤖 TEMMYDEEXC SCANNER\n\n"
                         "✅ Online\n\n"
-                        "📋 Paste a token contract address "
-                        "and I will scan it automatically.\n\n"
+                        "📋 Paste a token contract "
+                        "address only.\n\n"
                         "🟣 Solana\n"
-                        "🟡 BNB Chain\n"
-                        "🔵 Robinhood Chain\n\n"
-                        "🔐 Read-only — no automatic trading."
+                        "🟡 BNB\n"
+                        "🔵 Robinhood\n\n"
+                        "🔐 Read-only — no trading."
                     )
 
-                    print("📩 /start received")
                     continue
-
-                # =========================================
-                # IGNORE OTHER COMMANDS
-                # =========================================
 
                 if text.startswith("/"):
 
                     send_message(
                         chat_id,
-                        "📋 Paste the contract address only."
+                        "📋 Paste the contract address only.\n\n"
+                        "No command is required."
                     )
 
                     continue
 
+                # -------------------------
+                # SCAN
+                # -------------------------
+
                 print(
-                    f"🔎 Contract received: {text}"
+                    f"🔎 Contract received: {text}",
+                    flush=True
                 )
 
                 send_message(
@@ -421,14 +643,19 @@ def main():
 
                 try:
 
-                    result = scan_automatic(text)
+                    result = scan_automatic(
+                        text
+                    )
 
                     send_message(
                         chat_id,
                         result
                     )
 
-                    print("✅ Result sent.")
+                    print(
+                        "✅ Result sent.",
+                        flush=True
+                    )
 
                 except Exception as e:
 
@@ -437,7 +664,10 @@ def main():
                         f"{type(e).__name__}: {e}"
                     )
 
-                    print(error)
+                    print(
+                        error,
+                        flush=True
+                    )
 
                     send_message(
                         chat_id,
@@ -446,7 +676,11 @@ def main():
 
         except KeyboardInterrupt:
 
-            print("\n🛑 Bot stopped.")
+            print(
+                "\n🛑 Bot stopped.",
+                flush=True
+            )
+
             break
 
         except Exception as e:
@@ -454,11 +688,16 @@ def main():
             print(
                 "⚠️ Listener error:",
                 type(e).__name__,
-                e
+                e,
+                flush=True
             )
 
             time.sleep(5)
 
 
+# =========================================================
+# START
+# =========================================================
+
 if __name__ == "__main__":
-    main()
+    run_bot()
